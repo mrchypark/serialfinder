@@ -1,4 +1,4 @@
-module github.com/hs0zip/serialfinder
+module github.com/mrchypark/serialfinder
 
 go 1.23.0
 
