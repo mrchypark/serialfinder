@@ -8,6 +8,7 @@ It can filter the devices by the vendor id and product id, or leave them empty t
 ## Supported Platforms
 - Windows
 - Linux
+- MacOS
 
 ## Usage
 ```go
@@ -20,14 +21,14 @@ import (
 
 func main()
 {
-    devices, err := GetSerialDevices("1A86", "55D4")
-	if err != nil {
+    devices, err := serialfinder.GetSerialDevices("1A86", "55D4")
+    if err != nil {
         fmt.Println(err)
-	}
+    }
 
-	for _, device := range devices {
+    for _, device := range devices {
         fmt.Println(device)
-	}
+    }
 }
 ```
 
