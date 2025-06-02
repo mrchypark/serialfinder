@@ -7,38 +7,66 @@ import (
 	"bufio"
 	"bytes"
 	"fmt"
-	"os/exec"
+	"bytes"
+	"fmt"
+	"os/exec" // Keep this for the default executor
 	"regexp"
 	"strconv"
 	"strings"
 )
 
-// GetSerialDevices retrieves USB serial devices on macOS by querying the I/O Registry,
-// filtering by VID and PID, and finding the corresponding device path.
-func GetSerialDevices(vid, pid string) ([]SerialDeviceInfo, error) {
-	var devices []SerialDeviceInfo
+// commandExecutor defines an interface for executing external commands.
+// This allows for mocking exec.Command in tests.
+type commandExecutor interface {
+	Execute(name string, arg ...string) ([]byte, error)
+}
 
-	// Use ioreg to get device information in a parseable format
-	// -c IOSerialBSDClient: Focus on serial port client drivers
-	// -r: Recursive search up the device tree to find parent USB devices
-	// -l: Show properties for each device
-	cmd := exec.Command("ioreg", "-r", "-c", "IOSerialBSDClient", "-l")
-	var out bytes.Buffer
-	cmd.Stdout = &out
+// defaultExecutor is the default implementation of commandExecutor using exec.Command.
+type defaultExecutor struct{}
+
+func (de *defaultExecutor) Execute(name string, arg ...string) ([]byte, error) {
+	cmd := exec.Command(name, arg...)
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+
 	err := cmd.Run()
 	if err != nil {
-		// If ioreg command itself failed, this is an error.
-		// An empty output with an error is still an error.
-		// If output is also empty, it might indicate no devices OR a more fundamental issue.
-		errMsg := fmt.Sprintf("failed to run ioreg: %v", err)
-		if out.Len() > 0 {
-			errMsg = fmt.Sprintf("%s, output: %s", errMsg, out.String())
+		// Include stderr in the error message if available for better debugging.
+		if stderr.Len() > 0 {
+			return stdout.Bytes(), fmt.Errorf("command %s %v failed with error: %v, stderr: %s", name, strings.Join(arg, " "), err, stderr.String())
 		}
-		return nil, fmt.Errorf(errMsg)
+		return stdout.Bytes(), fmt.Errorf("command %s %v failed with error: %v", name, strings.Join(arg, " "), err)
+	}
+	return stdout.Bytes(), nil
+}
+
+// GetSerialDevices is the public function to retrieve USB serial devices on macOS.
+// It uses the default command executor.
+func GetSerialDevices(vid, pid string) ([]SerialDeviceInfo, error) {
+	return getSerialDevicesWithExecutor(vid, pid, &defaultExecutor{})
+}
+
+// getSerialDevicesWithExecutor is the internal implementation that allows using a custom commandExecutor.
+// This is used for testing.
+func getSerialDevicesWithExecutor(vid, pid string, executor commandExecutor) ([]SerialDeviceInfo, error) {
+	var devices []SerialDeviceInfo
+
+	// Use ioreg to get device information.
+	ioregOutput, err := executor.Execute("ioreg", "-r", "-c", "IOSerialBSDClient", "-l")
+	if err != nil {
+		// If the command itself failed, this is an error.
+		// The executor.Execute should ideally include command output if err is not nil but output exists.
+		// Based on current defaultExecutor, ioregOutput might contain partial stdout on error.
+		// We wrap the error from the executor.
+		// If ioregOutput is also empty, it might indicate no devices OR a more fundamental issue.
+		// The error message from defaultExecutor already includes stderr.
+		return nil, fmt.Errorf("failed to execute ioreg: %w", err)
 	}
 
 	// If ioreg ran successfully but produced no output, it means no serial devices were found.
-	if out.Len() == 0 {
+	if len(ioregOutput) == 0 {
 		return devices, nil
 	}
 
@@ -46,7 +74,7 @@ func GetSerialDevices(vid, pid string) ([]SerialDeviceInfo, error) {
 	targetVidUpper := strings.ToUpper(vid)
 	targetPidUpper := strings.ToUpper(pid)
 
-	scanner := bufio.NewScanner(&out)
+	scanner := bufio.NewScanner(bytes.NewReader(ioregOutput))
 	// currentUSBDevice holds properties of the most recently encountered USB device.
 	// We assume that an IOSerialBSDClient's properties will follow its parent USB device's properties.
 	var currentUSBDevice *SerialDeviceInfo
