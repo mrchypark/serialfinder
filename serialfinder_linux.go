@@ -23,6 +23,10 @@ func GetSerialDevices(vid, pid string) ([]SerialDeviceInfo, error) {
 		return nil, err
 	}
 
+	// Prepare VID/PID for case-insensitive comparison
+	targetVidUpper := strings.ToUpper(vid)
+	targetPidUpper := strings.ToUpper(pid)
+
 	// Iterate over each entry in the directory
 	for _, entry := range entries {
 		if entry.IsDir() {
@@ -45,50 +49,59 @@ func GetSerialDevices(vid, pid string) ([]SerialDeviceInfo, error) {
 		}
 
 		// Read the VID and PID
-		idVendor, err := os.ReadFile(filepath.Join(usbDir, "idVendor"))
+		idVendorBytes, err := os.ReadFile(filepath.Join(usbDir, "idVendor"))
 		if err != nil {
-			fmt.Printf("Error reading idVendor: %v\n", err)
-			continue
+			// If we can't read VID, this device is problematic. Return the error.
+			return nil, fmt.Errorf("error reading idVendor for %s (from %s): %w", usbDir, symlinkPath, err)
 		}
+		idVendor := idVendorBytes // Keep original variable name for minimal diff later if needed
 
-		idProduct, err := os.ReadFile(filepath.Join(usbDir, "idProduct"))
+		idProductBytes, err := os.ReadFile(filepath.Join(usbDir, "idProduct"))
 		if err != nil {
-			fmt.Printf("Error reading idProduct: %v\n", err)
-			continue
+			// If we can't read PID, this device is problematic. Return the error.
+			return nil, fmt.Errorf("error reading idProduct for %s (from %s): %w", usbDir, symlinkPath, err)
 		}
+		idProduct := idProductBytes // Keep original variable name
 
-		// Log the VID and PID for debugging
 		vidStr := strings.ToUpper(strings.TrimSpace(string(idVendor)))
 		pidStr := strings.ToUpper(strings.TrimSpace(string(idProduct)))
 
-		// Check if the VID and PID match the specified values
-		if vidStr != "" && vidStr != vid {
+		// Filter by VID if a VID is provided
+		if targetVidUpper != "" && vidStr != targetVidUpper {
 			continue
 		}
-		if pidStr != "" && pidStr != pid {
+		// Filter by PID if a PID is provided
+		if targetPidUpper != "" && pidStr != targetPidUpper {
 			continue
 		}
 
 		// Read the serial number
-		serialNumber, err := os.ReadFile(filepath.Join(usbDir, "serial"))
+		var serialNumberStr string
+		serialNumberBytes, err := os.ReadFile(filepath.Join(usbDir, "serial"))
 		if err != nil {
-			fmt.Printf("Error reading serial: %v\n", err)
-			serialNumber = []byte("")
+			// Non-critical if serial is missing, proceed with an empty serial number.
+			// No fmt.Printf here, just use empty string.
+			serialNumberStr = ""
+		} else {
+			serialNumberStr = strings.TrimSpace(string(serialNumberBytes))
 		}
 
 		// Add the device to the list
+		// Port is the stable /dev/serial/by-id path, which is useful for persistent device naming.
 		devices = append(devices, SerialDeviceInfo{
-			SerialNumber: strings.TrimSpace(string(serialNumber)),
+			SerialNumber: serialNumberStr,
 			Vid:          vidStr,
 			Pid:          pidStr,
-			Port:         symlinkPath,
+			Port:         symlinkPath, // symlinkPath is e.g., /dev/serial/by-id/usb-MyDevice_Serial-if00-port0
 		})
 	}
 
 	return devices, nil
 }
 
-// findSerialDeviceInfoDir returns the directory path of the USB device corresponding to the device path
+// findSerialDeviceInfoDir returns the directory path of the USB device corresponding to the device path.
+// It navigates up from the /sys/class/tty/{ttyName}/device symlink to find the parent USB device
+// directory that contains idVendor and idProduct files.
 func findSerialDeviceInfoDir(devicePath string) string {
 	// Get the full path to the tty device in /sys/class/tty
 	sysTTYPath := filepath.Join("/sys/class/tty", filepath.Base(devicePath), "device")
@@ -113,7 +126,8 @@ func findSerialDeviceInfoDir(devicePath string) string {
 	return ""
 }
 
-// checkForVIDPIDFiles checks if the directory contains idVendor and idProduct files
+// checkForVIDPIDFiles checks if the directory contains idVendor and idProduct files.
+// This helps confirm that the directory is indeed a USB device's sysfs entry.
 func checkForVIDPIDFiles(dir string) bool {
 	_, errVid := os.Stat(filepath.Join(dir, "idVendor"))
 	_, errPid := os.Stat(filepath.Join(dir, "idProduct"))
