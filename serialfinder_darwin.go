@@ -7,118 +7,164 @@ import (
 	"bufio"
 	"bytes"
 	"fmt"
-	"os/exec"
+	"os/exec" // Keep this for the default executor
 	"regexp"
 	"strconv"
 	"strings"
 )
 
-// GetSerialDevices retrieves USB serial devices on macOS by querying the I/O Registry,
-// filtering by VID and PID, and finding the corresponding device path.
-func GetSerialDevices(vid, pid string) ([]SerialDeviceInfo, error) {
-	var devices []SerialDeviceInfo
+// commandExecutor defines an interface for executing external commands.
+// This allows for mocking exec.Command in tests.
+type commandExecutor interface {
+	Execute(name string, arg ...string) ([]byte, error)
+}
 
-	// Use ioreg to get device information in a parseable format
-	// -c IOSerialBSDClient: Focus on serial port client drivers
-	// -r: Recursive search up the device tree to find parent USB devices
-	// -l: Show properties for each device
-	cmd := exec.Command("ioreg", "-r", "-c", "IOSerialBSDClient", "-l")
-	var out bytes.Buffer
-	cmd.Stdout = &out
+// defaultExecutor is the default implementation of commandExecutor using exec.Command.
+type defaultExecutor struct{}
+
+func (de *defaultExecutor) Execute(name string, arg ...string) ([]byte, error) {
+	cmd := exec.Command(name, arg...)
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+
 	err := cmd.Run()
 	if err != nil {
-		// Handle case where ioreg might fail or return non-zero if no devices found
-		// Check stderr? For now, assume error means failure or no devices.
-		// An empty output might just mean no serial devices connected.
-		if out.Len() == 0 {
-			// No output probably means no serial devices, not necessarily an error
-			return devices, nil
+		// Include stderr in the error message if available for better debugging.
+		if stderr.Len() > 0 {
+			return stdout.Bytes(), fmt.Errorf("command %s %v failed with error: %v, stderr: %s", name, strings.Join(arg, " "), err, stderr.String())
 		}
-		return nil, fmt.Errorf("failed to run ioreg: %v, output: %s", err, out.String())
+		return stdout.Bytes(), fmt.Errorf("command %s %v failed with error: %v", name, strings.Join(arg, " "), err)
+	}
+	return stdout.Bytes(), nil
+}
+
+// GetSerialDevices is the public function to retrieve USB serial devices on macOS.
+// It uses the default command executor.
+func GetSerialDevices(vid, pid string) ([]SerialDeviceInfo, error) {
+	return getSerialDevicesWithExecutor(vid, pid, &defaultExecutor{})
+}
+
+// getSerialDevicesWithExecutor is the internal implementation that allows using a custom commandExecutor.
+// This is used for testing.
+func getSerialDevicesWithExecutor(vid, pid string, executor commandExecutor) ([]SerialDeviceInfo, error) {
+	var devices []SerialDeviceInfo
+
+	// Use ioreg to get device information.
+	ioregOutput, err := executor.Execute("ioreg", "-r", "-c", "IOSerialBSDClient", "-l")
+	if err != nil {
+		// If the command itself failed, this is an error.
+		// The executor.Execute should ideally include command output if err is not nil but output exists.
+		// Based on current defaultExecutor, ioregOutput might contain partial stdout on error.
+		// We wrap the error from the executor.
+		// If ioregOutput is also empty, it might indicate no devices OR a more fundamental issue.
+		// The error message from defaultExecutor already includes stderr.
+		return nil, fmt.Errorf("failed to execute ioreg: %w", err)
+	}
+
+	// If ioreg ran successfully but produced no output, it means no serial devices were found.
+	if len(ioregOutput) == 0 {
+		return devices, nil
 	}
 
 	// Prepare VID/PID for case-insensitive comparison
 	targetVidUpper := strings.ToUpper(vid)
 	targetPidUpper := strings.ToUpper(pid)
 
-	scanner := bufio.NewScanner(&out)
-	var currentDevice *SerialDeviceInfo
-	var inUSBDeviceBlock bool // Flag to track if we are inside a relevant USB device entry
+	scanner := bufio.NewScanner(bytes.NewReader(ioregOutput))
+	// currentUSBDevice holds properties of the most recently encountered USB device.
+	// We assume that an IOSerialBSDClient's properties will follow its parent USB device's properties.
+	var currentUSBDevice *SerialDeviceInfo
 
-	// Regex to extract key-value pairs like "key" = value
-	// Handles strings ("value"), numbers (123), hex numbers (0x123)
+	// Regex to extract key-value pairs: "key" = value
 	reKeyValue := regexp.MustCompile(`"([^"]+)"\s*=\s*(.*)`)
 
 	for scanner.Scan() {
-		line := scanner.Text()
+		line := strings.TrimSpace(scanner.Text())
 
-		// Check if we are entering a new device potentially containing USB info
-		// Reset state if we leave an indented block associated with a potential USB parent
-		// This parsing logic is simplified; a full tree parser would be more robust.
-		// We primarily look for IOUSBHostDevice or IOUSBDevice containing VID/PID/Serial,
-		// and then find the child IOSerialBSDClient for the port.
-		if strings.Contains(line, "<class IOUSB") { // IOUSBHostDevice or IOUSBDevice
-			inUSBDeviceBlock = true
-			// Prepare a potential device structure, but don't add it yet
-			currentDevice = &SerialDeviceInfo{}
-		} else if !strings.HasPrefix(strings.TrimSpace(line), "|") && !strings.HasPrefix(strings.TrimSpace(line), "+-o") && !strings.HasPrefix(strings.TrimSpace(line), "{") && !strings.HasPrefix(strings.TrimSpace(line), "}") {
-			// If indentation level decreases significantly or line structure changes, assume we left the block
-			if !strings.Contains(line, "=") { // Heuristic: Lines without '=' are less likely part of the property block
-				inUSBDeviceBlock = false
-				currentDevice = nil // Reset current device context
+		// Detect the start of a new device entry in ioreg output.
+		// These lines typically start with "+-o" followed by the class name.
+		// Example: +-o IOUSBHostDevice  <class IOUSBHostDevice, id 0x10000027f, registered, matched, active, busy 0 (5 ms), retain 19>
+		// Or for the serial client: +-o IOSerialBSDClient  <class IOSerialBSDClient, id 0x1000002c6, registered, matched, active, busy 0 (0 ms), retain 7>
+		if strings.HasPrefix(line, "+-o") {
+			if strings.Contains(line, "IOUSBDevice") || strings.Contains(line, "IOUSBHostDevice") {
+				// New USB device encountered, reset currentUSBDevice
+				currentUSBDevice = &SerialDeviceInfo{}
+			} else if !strings.Contains(line, "IOSerialBSDClient") {
+				// If it's another type of device, and not the serial client itself,
+				// we might have left the scope of the current USB device.
+				// This is a heuristic: if an unrelated device appears, the previous USB context is likely no longer relevant
+				// for any subsequent IOSerialBSDClient unless a new USB device is explicitly listed.
+				currentUSBDevice = nil
 			}
+			// If it's an IOSerialBSDClient line, we don't reset currentUSBDevice here,
+			// as the following lines will contain its properties, and we need the context
+			// of the *parent* USB device.
 		}
 
-		if currentDevice != nil {
-			match := reKeyValue.FindStringSubmatch(strings.TrimSpace(line))
-			if len(match) == 3 {
-				key := match[1]
-				value := strings.TrimSpace(match[2])
+		match := reKeyValue.FindStringSubmatch(line)
+		if len(match) == 3 {
+			key := match[1]
+			value := strings.TrimSpace(match[2])
 
-				// Extract VID, PID, SerialNumber from the USB device block
-				if inUSBDeviceBlock {
-					switch key {
-					case "idVendor":
-						hexVal, err := parseHexValue(value)
-						if err == nil {
-							currentDevice.Vid = fmt.Sprintf("%04X", hexVal)
-						}
-					case "idProduct":
-						hexVal, err := parseHexValue(value)
-						if err == nil {
-							currentDevice.Pid = fmt.Sprintf("%04X", hexVal)
-						}
-					case "USB Serial Number": // Note: Key name can vary slightly (sometimes kUSBSerialNumberString)
-						currentDevice.SerialNumber = parseStringValue(value)
-					case "kUSBSerialNumberString": // Alternative key name
-						if currentDevice.SerialNumber == "" { // Prefer "USB Serial Number" if available
-							currentDevice.SerialNumber = parseStringValue(value)
-						}
+			// Populate properties for the current USB device context
+			if currentUSBDevice != nil {
+				switch key {
+				case "idVendor":
+					hexVal, err := parseHexValue(value)
+					if err == nil {
+						currentUSBDevice.Vid = fmt.Sprintf("%04X", hexVal)
+					}
+				case "idProduct":
+					hexVal, err := parseHexValue(value)
+					if err == nil {
+						currentUSBDevice.Pid = fmt.Sprintf("%04X", hexVal)
+					}
+				// USB Product Name and Serial Number can also be extracted if needed,
+				// but are not strictly part of SerialDeviceInfo struct currently.
+				case "USB Serial Number", "kUSBSerialNumberString":
+					// Favor "USB Serial Number" but take kUSBSerialNumberString if the other is not present or empty.
+					// The check `currentUSBDevice.SerialNumber == ""` handles this implicitly if "USB Serial Number" comes first.
+					sn := parseStringValue(value)
+					if sn != "" { // Only overwrite if we get a non-empty serial number
+						currentUSBDevice.SerialNumber = sn
 					}
 				}
+			}
 
-				// Extract Port from the IOSerialBSDClient block (which is a child)
-				if key == "IOCalloutDevice" {
-					// This property belongs to the IOSerialBSDClient, which should be listed *after*
-					// its parent USB device properties in the `ioreg -r` output.
+			// Check for IOCalloutDevice, which indicates the serial port path.
+			// This property is part of the IOSerialBSDClient.
+			if key == "IOCalloutDevice" {
+				// We expect currentUSBDevice to be populated from the parent USB device
+				// that appeared earlier in the ioreg output.
+				if currentUSBDevice != nil && currentUSBDevice.Vid != "" && currentUSBDevice.Pid != "" {
 					portPath := parseStringValue(value)
-					if portPath != "" && currentDevice.Vid != "" && currentDevice.Pid != "" {
-						currentDevice.Port = portPath
-
-						// Check if VID/PID match the filter (if provided)
-						vidMatch := (targetVidUpper == "" || currentDevice.Vid == targetVidUpper)
-						pidMatch := (targetPidUpper == "" || currentDevice.Pid == targetPidUpper)
+					if portPath != "" {
+						// We have a potential serial device. Check against VID/PID filters.
+						// currentUSBDevice.Vid and currentUSBDevice.Pid are already uppercase from fmt.Sprintf("%04X").
+						vidMatch := (targetVidUpper == "" || currentUSBDevice.Vid == targetVidUpper)
+						pidMatch := (targetPidUpper == "" || currentUSBDevice.Pid == targetPidUpper)
 
 						if vidMatch && pidMatch {
-							// Found a matching device, add a copy to the list
-							devices = append(devices, *currentDevice)
+							// Create a new SerialDeviceInfo for the list, copying relevant USB properties.
+							device := SerialDeviceInfo{
+								Port:         portPath,
+								Vid:          currentUSBDevice.Vid,
+								Pid:          currentUSBDevice.Pid,
+								SerialNumber: currentUSBDevice.SerialNumber,
+								// Description could be added here if parsed, e.g., from "USB Product Name"
+							}
+							devices = append(devices, device)
 						}
-						// Reset for the next potential device block found by ioreg
-						// Since IOCalloutDevice is usually the last relevant piece, reset here.
-						currentDevice = nil
-						inUSBDeviceBlock = false
 					}
 				}
+				// After processing an IOCalloutDevice, the properties of currentUSBDevice have been used
+				// or deemed irrelevant. It's not strictly necessary to reset currentUSBDevice here,
+				// as a new "+-o IOUSB..." line will do that. However, if multiple IOSerialBSDClient
+				// entries were nested under one IOUSBDevice (uncommon for distinct physical ports),
+				// not resetting could lead to issues. For typical scenarios, this is okay.
+				// For now, let the next "+-o IOUSB..." line handle the reset of currentUSBDevice.
 			}
 		}
 	}
@@ -130,30 +176,19 @@ func GetSerialDevices(vid, pid string) ([]SerialDeviceInfo, error) {
 	return devices, nil
 }
 
-// parseHexValue converts ioreg number values (like 0x1234 or 1234) to int64
+// parseHexValue converts ioreg number values to int64.
+// ioreg typically outputs VID/PID as decimal numbers, but can also use "0x" prefix for hex.
 func parseHexValue(value string) (int64, error) {
 	value = strings.TrimSpace(value)
-	// Remove trailing comma if present (sometimes happens in ioreg output)
-	value = strings.TrimSuffix(value, ",")
+	value = strings.TrimSuffix(value, ",") // Remove trailing comma
 
-	// Check if it's already a decimal number
-	decVal, errDec := strconv.ParseInt(value, 10, 64)
-	if errDec == nil {
-		return decVal, nil
-	}
-
-	// Try parsing as hex (ioreg usually uses 0x prefix, but let's be flexible)
-	if strings.HasPrefix(value, "0x") {
+	if strings.HasPrefix(value, "0x") || strings.HasPrefix(value, "0X") {
+		// Explicitly hex if "0x" prefix is present
 		return strconv.ParseInt(value[2:], 16, 64)
 	}
-	// Fallback attempt if no prefix but maybe hex? Unlikely needed for VID/PID.
-	hexVal, errHex := strconv.ParseInt(value, 16, 64)
-	if errHex == nil {
-		return hexVal, nil
-	}
-
-	// Return the original decimal error if hex also failed
-	return 0, errDec
+	// Otherwise, assume it's a decimal number (standard for ioreg idVendor/idProduct)
+	// If it's not a valid decimal, this will return an error.
+	return strconv.ParseInt(value, 10, 64)
 }
 
 // parseStringValue extracts string values like "My String" -> My String
@@ -161,9 +196,9 @@ func parseStringValue(value string) string {
 	value = strings.TrimSpace(value)
 	// Remove trailing comma if present
 	value = strings.TrimSuffix(value, ",")
-	// Remove surrounding quotes
-	if strings.HasPrefix(value, `"`) && strings.HasSuffix(value, `"`) {
+	// Remove surrounding quotes only if the string is long enough to contain them
+	if len(value) >= 2 && strings.HasPrefix(value, `"`) && strings.HasSuffix(value, `"`) {
 		return value[1 : len(value)-1]
 	}
-	return value // Return as-is if not quoted
+	return value // Return as-is if not properly quoted or too short
 }
