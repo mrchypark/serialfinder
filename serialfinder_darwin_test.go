@@ -4,9 +4,7 @@
 package serialfinder
 
 import (
-	"bytes"
 	"errors"
-	"fmt"
 	"reflect"
 	"strings"
 	"testing"
