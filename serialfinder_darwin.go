@@ -196,9 +196,9 @@ func parseStringValue(value string) string {
 	value = strings.TrimSpace(value)
 	// Remove trailing comma if present
 	value = strings.TrimSuffix(value, ",")
-	// Remove surrounding quotes
-	if strings.HasPrefix(value, `"`) && strings.HasSuffix(value, `"`) {
+	// Remove surrounding quotes only if the string is long enough to contain them
+	if len(value) >= 2 && strings.HasPrefix(value, `"`) && strings.HasSuffix(value, `"`) {
 		return value[1 : len(value)-1]
 	}
-	return value // Return as-is if not quoted
+	return value // Return as-is if not properly quoted or too short
 }
