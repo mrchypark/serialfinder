@@ -11,7 +11,7 @@ jobs:
     strategy:
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
-        go-version: ['1.19.x'] # Using a recent stable Go version
+        go-version: ['1.23.x'] # Using a recent stable Go version
     runs-on: ${{ matrix.os }}
     steps:
     - name: Checkout code
